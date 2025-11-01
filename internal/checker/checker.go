@@ -71,18 +71,27 @@ type Checker struct {
 // CONSTRUCTOR AND INITIALIZATION
 // ============================================================================
 
-// NewChecker creates a new checker instance
-func NewChecker(config *types.CheckerConfig) *Checker {
-	ctx, cancel := context.WithCancel(context.Background())
-	
+// initializeContext creates a cancellable context for checker lifecycle management
+func initializeContext() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
+
+// initializeWorkflowSystem creates and configures the workflow engine and variable manipulator
+func initializeWorkflowSystem() (*WorkflowEngine, *VariableManipulator) {
 	workflowEngine := NewWorkflowEngine()
 	varManipulator := NewVariableManipulator(workflowEngine.variables)
-	
-	// Initialize advanced proxy management
+	return workflowEngine, varManipulator
+}
+
+// initializeProxySystem creates and configures the proxy management and health monitoring systems
+func initializeProxySystem() (*AdvancedProxyManager, *ProxyHealthMonitor) {
 	proxyManager := NewAdvancedProxyManager(StrategyBestScore)
 	healthMonitor := NewProxyHealthMonitor(proxyManager)
-	
-	// Initialize structured logger
+	return proxyManager, healthMonitor
+}
+
+// initializeLogger creates a structured logger with fallback to stdout on file error
+func initializeLogger() (*logger.StructuredLogger, error) {
 	loggerConfig := logger.LoggerConfig{
 		Level:      logger.INFO,
 		JSONFormat: true,
@@ -90,21 +99,63 @@ func NewChecker(config *types.CheckerConfig) *Checker {
 		BufferSize: 1000,
 		Component:  "checker",
 	}
+	
 	structuredLogger, err := logger.NewStructuredLogger(loggerConfig)
 	if err != nil {
 		// Fall back to stdout if file logging fails
 		loggerConfig.OutputFile = ""
-		structuredLogger, _ = logger.NewStructuredLogger(loggerConfig)
+		structuredLogger, fallbackErr := logger.NewStructuredLogger(loggerConfig)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("failed to initialize logger (file: %v, stdout: %v)", err, fallbackErr)
+		}
+		return structuredLogger, nil
 	}
 	
+	return structuredLogger, nil
+}
+
+// initializeChannels creates task and result channels based on worker configuration
+func initializeChannels(config *types.CheckerConfig) (chan types.WorkerTask, chan types.WorkerResult) {
+	channelSize := config.MaxWorkers * 2
+	taskChan := make(chan types.WorkerTask, channelSize)
+	resultChan := make(chan types.WorkerResult, channelSize)
+	return taskChan, resultChan
+}
+
+// NewChecker creates a new checker instance by orchestrating subsystem initializers
+func NewChecker(config *types.CheckerConfig) *Checker {
+	// Initialize context for lifecycle management
+	ctx, cancel := initializeContext()
+	
+	// Initialize workflow processing subsystem
+	workflowEngine, varManipulator := initializeWorkflowSystem()
+	
+	// Initialize proxy management subsystem
+	proxyManager, healthMonitor := initializeProxySystem()
+	
+	// Initialize logging subsystem with error handling
+	structuredLogger, err := initializeLogger()
+	if err != nil {
+		// Logger initialization failed completely (both file and stdout)
+		// This is extremely rare but we handle it gracefully
+		log.Printf("[ERROR] Failed to initialize structured logger: %v - checker will have limited logging", err)
+		// structuredLogger will be nil, causing panic on first use
+		// In practice, stdout logging should never fail, so this is a critical system error
+		panic(fmt.Sprintf("critical: unable to initialize any logging mechanism: %v", err))
+	}
+	
+	// Initialize communication channels
+	taskChan, resultChan := initializeChannels(config)
+	
+	// Assemble the checker with all initialized subsystems
 	return &Checker{
 		Config:         config,
 		Stats:          &types.CheckerStats{},
 		Proxies:        make([]types.Proxy, 0),
 		Configs:        make([]types.Config, 0),
 		Combos:         make([]types.Combo, 0),
-		taskChan:       make(chan types.WorkerTask, config.MaxWorkers*2),
-		resultChan:     make(chan types.WorkerResult, config.MaxWorkers*2),
+		taskChan:       taskChan,
+		resultChan:     resultChan,
 		ctx:            ctx,
 		cancel:         cancel,
 		exporter:       NewResultExporter(config.OutputDirectory, config.OutputFormat),
