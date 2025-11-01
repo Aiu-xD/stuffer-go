@@ -256,7 +256,7 @@ func (c *Checker) LoadProxies(proxyPath string) error {
 // CORE CHECKER OPERATIONS
 // ============================================================================
 
-// Start begins the checking process
+// Start begins the checking process with coordinated subsystem initialization
 func (c *Checker) Start() error {
 	c.Stats.StartTime = time.Now()
 	
@@ -270,30 +270,24 @@ func (c *Checker) Start() error {
 	// Start health monitor for proxy management
 	c.healthMonitor.Start()
 	
-	// Start workers
-	for i := 0; i < c.Config.MaxWorkers; i++ {
-		c.wg.Add(1)
-		go c.worker()
-	}
-
-	// Start result processor
-	go c.processResults()
-
-	// Generate tasks
-	go c.generateTasks()
+	// Start worker subsystems with lifecycle tracking
+	c.startWorkerPool()
+	c.startResultProcessor()
+	c.startTaskGenerator()
 
 	c.logger.Info("Checker started successfully")
 	return nil
 }
 
-// Stop stops the checking process
+// Stop stops the checking process with coordinated shutdown sequence
 func (c *Checker) Stop() {
 	c.logger.Info("Stopping checker")
-	c.cancel()
+	
+	// Stop external subsystems first
 	c.healthMonitor.Stop()
-	close(c.taskChan)
-	c.wg.Wait()
-	close(c.resultChan)
+	
+	// Execute worker pool shutdown sequence
+	c.stopWorkerPool()
 	
 	// Log final statistics
 	stats := c.GetStats()
@@ -313,6 +307,47 @@ func (c *Checker) Stop() {
 // ============================================================================
 // WORKER MANAGEMENT
 // ============================================================================
+
+// startWorkerPool spawns N worker goroutines with proper lifecycle tracking
+func (c *Checker) startWorkerPool() {
+	for i := 0; i < c.Config.MaxWorkers; i++ {
+		c.wg.Add(1)
+		go c.worker()
+	}
+}
+
+// startResultProcessor spawns the result processing goroutine with WaitGroup tracking
+func (c *Checker) startResultProcessor() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.processResults()
+	}()
+}
+
+// startTaskGenerator spawns the task generation goroutine with WaitGroup tracking
+func (c *Checker) startTaskGenerator() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.generateTasks()
+	}()
+}
+
+// stopWorkerPool initiates worker pool shutdown sequence with proper ordering
+func (c *Checker) stopWorkerPool() {
+	// Signal cancellation to all goroutines
+	c.cancel()
+	
+	// Close task channel to signal workers to exit
+	close(c.taskChan)
+	
+	// Wait for all workers and auxiliary goroutines to complete
+	c.wg.Wait()
+	
+	// Close result channel after all workers finished
+	close(c.resultChan)
+}
 
 // worker is the main worker function that processes tasks
 func (c *Checker) worker() {
