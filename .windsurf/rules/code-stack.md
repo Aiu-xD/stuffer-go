@@ -2,9 +2,13 @@
 trigger: always_on
 ---
 
+# **Follow each and every RULES below**
+
 ## System Environment
 
-- **OS**: Arch Linux
+- **OS**: Arch Linux 
+
+- **Shell**: 'fish'
 
 - **Available Tools**: 
   - `fzf` for fuzzy finding
@@ -34,7 +38,7 @@ trigger: always_on
   - `github.com/Noooste/azuretls-client` (main HTTP client)
   - `github.com/colduction/keycheck-go` (validation logic)
 
-### Tool Integration
+### MCP TOOL Integration
 - **USE** `code-reasoning` MCP for code analysis and reasoning
 - **USE** `github-mcp-server` for Git operations
 - **USE** `exa` for web searches and programming context gathering
@@ -44,3 +48,5 @@ trigger: always_on
 2. Direct execution over compilation for testing
 3. Leverage available tools for efficient navigation and search
 4. Maintain architectural consistency
+5. PREFER small response output ALWAYS keep the response output small and use simpler terms for better understanding
+6. ALWAYS USE 'MCP TOOL Integration'

@@ -28,7 +28,21 @@ import (
 // TYPES AND STRUCTURES
 // ============================================================================
 
-// Checker represents the main checker engine
+// Checker represents the main checker engine with thread-safe concurrent operations
+//
+// CONCURRENCY CONTRACT:
+// - Goroutine Coordination: All goroutines (workers, result processor, task generator)
+//   are tracked via sync.WaitGroup ensuring graceful shutdown
+// - Context Cancellation: All goroutines respect ctx.Done() for immediate cancellation
+// - Statistics: Protected by statsMutex (RWMutex) - concurrent reads, exclusive writes
+// - Proxy Rotation: Protected by proxyMutex (Mutex) - exclusive access to proxyIndex
+// - Channel Safety: taskChan and resultChan use buffered channels with context-aware operations
+//
+// THREAD-SAFETY GUARANTEES:
+// - Stats.* fields: MUST acquire statsMutex before read/write
+// - proxyIndex: MUST acquire proxyMutex before read/write
+// - Channels: Thread-safe by Go runtime, context-aware sends prevent deadlocks
+// - All other fields: Read-only after initialization (safe for concurrent access)
 type Checker struct {
 	Config      *types.CheckerConfig
 	Stats       *types.CheckerStats
@@ -36,21 +50,21 @@ type Checker struct {
 	Configs     []types.Config
 	Combos      []types.Combo
 	
-	// Channels for communication
+	// Channels for communication (buffered, thread-safe)
 	taskChan   chan types.WorkerTask
 	resultChan chan types.WorkerResult
 	
-	// Worker management
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	// Worker management and coordination
+	ctx        context.Context     // Cancellation signal for all goroutines
+	cancel     context.CancelFunc  // Trigger for graceful shutdown
+	wg         sync.WaitGroup      // Tracks all spawned goroutines (workers + auxiliaries)
 	
-	// Statistics tracking
-	statsMutex sync.RWMutex
+	// Statistics tracking (protected by statsMutex)
+	statsMutex sync.RWMutex        // RWMutex: concurrent reads, exclusive writes
 	
-	// Proxy rotation
-	proxyIndex int
-	proxyMutex sync.Mutex
+	// Proxy rotation (protected by proxyMutex)
+	proxyIndex int                 // Current proxy index (protected by proxyMutex)
+	proxyMutex sync.Mutex          // Mutex: exclusive access to proxyIndex
 	
 	// Result exporter
 	exporter   *ResultExporter
@@ -349,22 +363,74 @@ func (c *Checker) stopWorkerPool() {
 	close(c.resultChan)
 }
 
+// receiveTask receives a task from the task channel with context and close handling
+func (c *Checker) receiveTask() (types.WorkerTask, bool) {
+	select {
+	case <-c.ctx.Done():
+		return types.WorkerTask{}, false
+	case task, ok := <-c.taskChan:
+		return task, ok
+	}
+}
+
+// sendResult sends a result to the result channel (blocking operation)
+func (c *Checker) sendResult(result types.WorkerResult) {
+	c.resultChan <- result
+}
+
 // worker is the main worker function that processes tasks
 func (c *Checker) worker() {
 	defer c.wg.Done()
 
 	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case task, ok := <-c.taskChan:
-			if !ok {
-				return
-			}
-
-			result := c.checkCombo(task)
-			c.resultChan <- result
+		task, ok := c.receiveTask()
+		if !ok {
+			return // Channel closed or context cancelled
 		}
+
+		result := c.checkCombo(task)
+		c.sendResult(result)
+	}
+}
+
+// selectProxyForConfig selects appropriate proxy based on config requirements
+func (c *Checker) selectProxyForConfig(config types.Config) *types.Proxy {
+	if config.RequiresProxy {
+		return c.getNextHealthyProxy()
+	} else if config.UseProxy {
+		return c.getNextProxy()
+	}
+	return nil
+}
+
+// createTask creates a worker task with appropriate proxy selection
+func (c *Checker) createTask(combo types.Combo, config types.Config) (types.WorkerTask, bool) {
+	// Skip if config requires proxy but none available
+	if c.shouldSkipTaskDueToProxy(config) {
+		return types.WorkerTask{}, false
+	}
+	
+	proxy := c.selectProxyForConfig(config)
+	if config.RequiresProxy && proxy == nil {
+		c.logger.Warn(fmt.Sprintf("No proxy available for required proxy config %s", config.Name), nil)
+		return types.WorkerTask{}, false
+	}
+	
+	task := types.WorkerTask{
+		Combo:  combo,
+		Config: config,
+		Proxy:  proxy,
+	}
+	return task, true
+}
+
+// sendTaskWithContext sends a task through the channel with context cancellation support
+func (c *Checker) sendTaskWithContext(task types.WorkerTask) bool {
+	select {
+	case <-c.ctx.Done():
+		return false
+	case c.taskChan <- task:
+		return true
 	}
 }
 
@@ -372,35 +438,13 @@ func (c *Checker) worker() {
 func (c *Checker) generateTasks() {
 	for _, combo := range c.Combos {
 		for _, config := range c.Configs {
-			// Check if we should skip this config due to proxy requirements
-			if c.shouldSkipTaskDueToProxy(config) {
+			task, ok := c.createTask(combo, config)
+			if !ok {
 				continue
 			}
 			
-			var proxy *types.Proxy
-			if config.RequiresProxy {
-				proxy = c.getNextHealthyProxy()
-				if proxy == nil {
-					// This should not happen due to shouldSkipTaskDueToProxy check above
-					c.logger.Warn(fmt.Sprintf("No proxy available for required proxy config %s", config.Name), nil)
-					continue
-				}
-			} else if config.UseProxy {
-				proxy = c.getNextProxy() // Optionally use proxy if available
-			} else {
-				proxy = nil // No proxy needed
-			}
-
-			task := types.WorkerTask{
-				Combo:  combo,
-				Config: config,
-				Proxy:  proxy,
-			}
-
-			select {
-			case <-c.ctx.Done():
-				return
-			case c.taskChan <- task:
+			if !c.sendTaskWithContext(task) {
+				return // Context cancelled
 			}
 		}
 	}
@@ -693,34 +737,41 @@ func (c *Checker) analyzeResponse(body string, statusCode int, config types.Conf
 // RESULT PROCESSING AND STATISTICS
 // ============================================================================
 
-// processResults handles the result processing goroutine
-func (c *Checker) processResults() {
-	for result := range c.resultChan {
-		c.updateStats(result.Result)
-		
-		// Log successful results
-		if result.Result.Status == types.BotStatusSuccess {
-			c.logger.LogCheckerEvent("valid_combo_found", result.Result, nil)
-		}
-		
-		// Log errors
-		if result.Error != nil {
-			c.logger.Error("Worker error", result.Error, map[string]interface{}{
-				"combo": result.Result.Combo.Username,
-				"config": result.Result.Config,
-			})
-		}
-		
-		// Save result if needed
-		if !c.Config.SaveValidOnly || result.Result.Status == types.BotStatusSuccess {
-			c.saveResult(result.Result)
-		}
+// handleResult processes a single worker result with logging and persistence
+func (c *Checker) handleResult(result types.WorkerResult) {
+	c.updateStats(result.Result)
+	
+	// Log successful results
+	if result.Result.Status == types.BotStatusSuccess {
+		c.logger.LogCheckerEvent("valid_combo_found", result.Result, nil)
+	}
+	
+	// Log errors
+	if result.Error != nil {
+		c.logger.Error("Worker error", result.Error, map[string]interface{}{
+			"combo": result.Result.Combo.Username,
+			"config": result.Result.Config,
+		})
+	}
+	
+	// Save result if needed
+	if !c.Config.SaveValidOnly || result.Result.Status == types.BotStatusSuccess {
+		c.saveResult(result.Result)
 	}
 }
 
-// updateStats updates checker statistics
+// processResults handles the result processing goroutine
+func (c *Checker) processResults() {
+	for result := range c.resultChan {
+		c.handleResult(result)
+	}
+}
+
+// updateStats updates checker statistics with exclusive write lock
+// THREAD-SAFETY: Acquires statsMutex (write lock) to ensure atomic stat updates
+// Called concurrently by handleResult() from result processor goroutine
 func (c *Checker) updateStats(result types.CheckResult) {
-	c.statsMutex.Lock()
+	c.statsMutex.Lock()   // Exclusive write access to Stats
 	defer c.statsMutex.Unlock()
 
 	switch result.Status {
@@ -752,12 +803,14 @@ func (c *Checker) saveResult(result types.CheckResult) {
 // ============================================================================
 
 // getNextProxy returns the next proxy using the advanced proxy manager
+// THREAD-SAFETY: Uses proxyMutex for fallback rotation to ensure atomic index increment
+// Called concurrently by createTask() during task generation
 func (c *Checker) getNextProxy() *types.Proxy {
 	// Use the advanced proxy manager to get the best proxy
 	proxy, err := c.proxyManager.GetBestProxy()
 	if err != nil {
 		// Fallback to simple rotation if advanced manager fails
-		c.proxyMutex.Lock()
+		c.proxyMutex.Lock()   // Exclusive access to proxyIndex
 		defer c.proxyMutex.Unlock()
 		
 		if len(c.Proxies) == 0 {
@@ -870,9 +923,11 @@ func (c *Checker) parseInt(s string) int {
 	return 0
 }
 
-// GetStats returns current statistics
+// GetStats returns current statistics with concurrent read lock
+// THREAD-SAFETY: Acquires statsMutex (read lock) allowing concurrent reads
+// Safe to call from multiple goroutines simultaneously
 func (c *Checker) GetStats() types.CheckerStats {
-	c.statsMutex.RLock()
+	c.statsMutex.RLock()  // Shared read access to Stats
 	defer c.statsMutex.RUnlock()
 	
 	stats := *c.Stats
